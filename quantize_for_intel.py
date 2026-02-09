@@ -145,16 +145,19 @@ def sort_layers_by_precision(
         # The 'layer' for NNCF is the operation that *consumes* the constant
         # weight, not the constant itself. We find the consumer node to get
         # the correct name for the ignored_scope.
-        target_inputs = op.get_output_target_inputs(0)
-        if not target_inputs:
-            logging.debug(
-                "Constant op '%s' has no consumers. Skipping.",
-                op.get_friendly_name(),
-            )
-            continue
-        # A weight constant is typically consumed by only one operation.
-        consumer_op = next(iter(target_inputs)).get_node()
-        layer: str = consumer_op.get_friendly_name().lower()
+        # target_inputs = op.get_output_target_inputs(0)
+        # if not target_inputs:
+        #     logging.debug(
+        #         "Constant op '%s' has no consumers. Skipping.",
+        #         op.get_friendly_name(),
+        #     )
+        #     continue
+        # # A weight constant is typically consumed by only one operation.
+        # consumer_op = next(iter(target_inputs)).get_node()
+        # layer: str = consumer_op.get_friendly_name().lower()
+
+        # Get layer name
+        layer: str = op.get_friendly_name().lower()
 
         # Get parameter count (size) of the weight constant
         params: int = math.prod(op.get_output_tensor(0).get_shape())
