@@ -153,23 +153,58 @@ def sort_layers_by_precision(
                 op.get_friendly_name(),
             )
             continue
-        # A weight constant is typically consumed by only one operation.
+
         consumer_op = next(iter(target_inputs)).get_node()
-        layer: str = consumer_op.get_friendly_name().lower()
+        layer_name_node = consumer_op
+
+        # If the immediate consumer is a Convert or Gather operation, it is
+        # likely an intermediate step. The actual layer to target is the
+        # consumer of *this* operation.
+        consumer_type = consumer_op.get_type_name()
+        if consumer_type in ["Convert", "Gather"]:
+            logging.debug(
+                "Found intermediate op '%s' of type %s. "
+                "Looking for its consumer.",
+                consumer_op.get_friendly_name(),
+                consumer_type,
+            )
+            # Using list() to exhaust the iterator and check its contents
+            real_consumer_inputs = list(
+                consumer_op.output(0).get_target_inputs()
+            )
+            if real_consumer_inputs:
+                # The real consumer is the node we want to name.
+                layer_name_node = real_consumer_inputs[0].get_node()
+            else:
+                logging.debug(
+                    "Intermediate op '%s' has no consumers. "
+                    "Using op's name as a fallback.",
+                    consumer_op.get_friendly_name(),
+                )
+
+        # NNCF's ignored_scope expects the full node name. We use the friendly
+        # name of the consumer operation for this.
+        layer: str = layer_name_node.get_friendly_name()
 
         # Get parameter count (size) of the weight constant
         params: int = math.prod(op.get_output_tensor(0).get_shape())
 
-        # This ternary provides substring matching from user-defined layer
+        # This provides substring matching from user-defined layer
         # names to model layer names.
-        # e.g. "q_proj" in "model.layers.0.self_attn.q_proj.weight"
-        if any(x in layer for x in layer_precision_map.get("FP16", [])):
+        # e.g. "q_proj" in "__module.model.layers.0.self_attn.q_proj/ov_ext::linear/MatMul"
+        # We use lower() for case-insensitive matching against the map, but
+        # store the original name.
+        if any(x in layer.lower() for x in layer_precision_map.get("FP16", [])):
             layer_map["FP16"].append(layer)
             param_counts["FP16"] += params
-        elif any(x in layer for x in layer_precision_map.get("INT8_SYM", [])):
+        elif any(
+            x in layer.lower() for x in layer_precision_map.get("INT8_SYM", [])
+        ):
             layer_map["INT8_SYM"].append(layer)
             param_counts["INT8_SYM"] += params
-        elif any(x in layer for x in layer_precision_map.get("INT4_SYM", [])):
+        elif any(
+            x in layer.lower() for x in layer_precision_map.get("INT4_SYM", [])
+        ):
             layer_map["INT4_SYM"].append(layer)
             param_counts["INT4_SYM"] += params
         else:
@@ -338,6 +373,21 @@ def quantize_and_save_model(
     # ov.Model is a subclass of PreTrainedModel, but to access the underlying
     # OpenVINO model, we need to set the type of model.model to ov.Model.
     ov_model: ov.Model = model.model  # type: ignore
+
+    # --- NNCF Graph Logging ---
+    # Create an NNCF graph to inspect the node names available for quantization
+    from nncf.common.factory import NNCFGraphFactory
+
+    nncf_graph = NNCFGraphFactory.create(model.model)
+    available_node_names = [
+        node.node_name for node in nncf_graph.get_all_nodes()
+    ]
+    logging.info(
+        "Available NNCF node names for quantization:\n%s",
+        json.dumps(available_node_names, indent=2),
+    )
+    # --- End of Logging ---
+
     sorting_result = sort_layers_by_precision(
         ov_model, layer_precision_mapping, unknown_quantization_level
     )
