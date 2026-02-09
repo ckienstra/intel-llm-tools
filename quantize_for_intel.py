@@ -1,4 +1,4 @@
-"""quantize_for_intel.py
+"""quantize_for_intel.py.
 
 This script performs a multi-stage conversion and quantization process to
 prepare a HuggingFace FP16 model for efficient inference on Intel hardware
@@ -20,19 +20,21 @@ top, and includes error handling and logging for better traceability of the
 conversion process.
 """
 
-import shutil
-import subprocess
+import json
+import logging
 import math
 from pathlib import Path
-from transformers import AutoConfig, AutoTokenizer
-import json
-import nncf
+import shutil
+import subprocess
 from typing import NamedTuple
+
+import nncf
+import openvino as ov
+from openvino_tokenizers import convert_tokenizer
 from optimum.intel import OVModelForCausalLM
 from optimum.modeling_base import OptimizedModel
-from openvino_tokenizers import convert_tokenizer
-import openvino as ov
-import logging
+from transformers import AutoConfig
+from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logging.getLogger("nncf").setLevel(logging.DEBUG)
@@ -48,8 +50,7 @@ fake_fp16_dir: Path = Path(
 # TODO: This is a temp dir. Make a per-run random seed
 # subdir in this location. Then, deletion is scoped.
 intermediate_dir: Path = Path(
-    "/media/Sandisk-500G/kubernetes-volumes/llm-quantization/"
-    "Cydonia-Temp-Dir"
+    "/media/Sandisk-500G/kubernetes-volumes/llm-quantization/Cydonia-Temp-Dir"
 )
 final_dir: Path = Path(
     "/media/Sandisk-500G/kubernetes-volumes/llm-quantization/"
@@ -88,6 +89,8 @@ class LayerSortingResult(NamedTuple):
 
 
 class Error(Exception):
+    """Base exception class for this module."""
+
     pass
 
 
@@ -102,6 +105,23 @@ def sort_layers_by_precision(
     layer_precision_map: dict[str, list[str]],
     unknown_quantization_level: str,
 ) -> LayerSortingResult:
+    """Sort model layers by quantization precision level.
+
+    Analyzes the OpenVINO model to categorize layers based on the provided
+    precision mapping, assigning each layer a quantization level (FP16,
+    INT8_SYM, INT4_SYM) based on substring matching of layer names.
+
+    Args:
+        ov_model (ov.Model): The OpenVINO model to analyze.
+        layer_precision_map (dict[str, list[str]]): Mapping of quantization
+            levels to lists of layer name substrings for categorization.
+        unknown_quantization_level (str): Default quantization level to
+            assign to layers that don't match any precision mapping.
+
+    Returns:
+        LayerSortingResult: Named tuple containing parameter counts per
+            quantization level and mapping of layers to their assigned levels.
+    """
     logging.info("\nSorting model layers by quantization precision.")
     param_counts: dict[str, int] = {
         "FP16": 0,
@@ -178,6 +198,21 @@ def format_and_save_tokenizer(
     input_dir: Path,
     output_dir: Path,
 ) -> None:
+    """Convert and save the tokenizer in OpenVINO format.
+
+    Loads the tokenizer from the input directory and converts it to OpenVINO-IR
+    format. Applies special handling for Mistral models that require a regex
+    fix. Saves both tokenizer and detokenizer models if available.
+
+    Args:
+        input_dir (Path): The location on disk of the HuggingFace model
+                          containing the tokenizer to convert.
+        output_dir (Path): The location on disk where the converted tokenizer
+                           should be saved.
+
+    Raises:
+        FileNotFoundError: If the config.json file is not found in input_dir.
+    """
     # Check if the model is a Mistral model by inspecting its config
     # TODO: "config.json" is specific to HuggingFace.
     # TODO: Save the filename to a variable.
@@ -189,7 +224,7 @@ def format_and_save_tokenizer(
             f"Config file not found at {config_path}. "
             "Cannot determine model type for tokenizer formatting."
         )
-    with open(config_path, "r", encoding="utf-8") as f:
+    with open(config_path, encoding="utf-8") as f:
         config = json.load(f)
         if config.get("model_type") == "mistral":
             is_mistral_model = True
@@ -218,8 +253,7 @@ def format_and_save_tokenizer(
 
 
 def convert_hf_to_openvino_ir(input_dir: Path, output_dir: Path) -> None:
-    """
-    Convert the HuggingFace FP16 model into an OpenVINO-IR FP16 model.
+    """Convert the HuggingFace FP16 model into an OpenVINO-IR FP16 model.
 
     This is to make it
     compatible with the Optimum-Intel API. This conversion must be done before
@@ -275,6 +309,10 @@ def quantize_and_save_model(
                           to be quantized.
         output_dir (Path): The location on disk where the quantized model
                            should be saved.
+        layer_precision_mapping (dict[str, list[str]] | None): Mapping of
+            quantization levels to lists of layer name substrings.
+        unknown_quantization_level (str | None): Default quantization level
+            for layers not matching the mapping.
     """
     # Set defaults for optional parameters to avoid mutable default arguments
     # and ensure the function can be called with minimal parameters if desired.
@@ -352,6 +390,21 @@ def quantize_and_save_model(
 
 
 def run_sanitized_conversion() -> None:
+    """Execute the full conversion and quantization pipeline.
+
+    Orchestrates the multi-stage process to convert a HuggingFace FP16 model
+    to an OpenVINO-IR quantized model. This includes:
+    1. Converting the HuggingFace model to OpenVINO-IR format
+    2. Quantizing the model according to the layer precision mapping
+    3. Converting and saving the tokenizer in OpenVINO format
+
+    The function cleans up intermediate directories before and after execution,
+    and performs a final sanity check on the resulting model file size.
+
+    Note:
+        Output directories (final_dir, intermediate_dir) will be overwritten
+        if they already exist.
+    """
     # FIXME: This function has become a stand-in for __main__.
     # TODO: Explain clearly that output will be overwritten.
     # TODO: Maybe add a prompt to confirm deletion?
@@ -364,32 +417,26 @@ def run_sanitized_conversion() -> None:
         convert_hf_to_openvino_ir(
             input_dir=fake_fp16_dir, output_dir=intermediate_dir
         )
-    except Exception as e:
-        raise e
-
-    try:
         quantize_and_save_model(
             input_dir=intermediate_dir,
             output_dir=final_dir,
             layer_precision_mapping=LAYER_PRECISION_MAPPING,
             unknown_quantization_level=UNKNOWN_QUANTIZATION_LEVEL,
         )
-    except Exception as e:
-        raise e
-
-    try:
         format_and_save_tokenizer(
             input_dir=fake_fp16_dir,
             output_dir=final_dir,
         )
-    except Exception as e:
-        raise e
-
-    # Cleanup the temp dir.
-    shutil.rmtree(intermediate_dir)
+    finally:
+        # Cleanup the temp dir.
+        if intermediate_dir.exists():
+            shutil.rmtree(intermediate_dir)
 
     # TODO: Remove this crude file size check.
     bin_file = final_dir / "openvino_model.bin"
+    if not bin_file.exists():
+        logging.error("Quantization failed, model file not created.")
+        return
     size_gb = bin_file.stat().st_size / (1024**3)
     print(f"\n[Result] Final Model Size: {size_gb:.2f} GB")
 
