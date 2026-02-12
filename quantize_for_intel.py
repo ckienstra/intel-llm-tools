@@ -56,23 +56,22 @@ final_dir: Path = Path(
     "/media/Sandisk-500G/kubernetes-volumes/llm-quantization/"
     "Cydonia-Mixed-Quant-RtN"
 )
-# Here's my thinking to preserve LLM quality while maximizing quantization:
-# - Keep the embedding and output layers in FP16, as they are critical for
-#   maintaining model quality.
-# - Quantize the attention projection layers to INT8_SYM, as they are important
-#   but can tolerate some quantization without a significant quality drop.
-# - Quantize the feedforward layers to INT4_SYM, as they are less sensitive
-#   to quantization and can benefit from the smaller size.
-# My rough estimates show that this results in a compressed model that's about
-# 10% bigger in VRAM than a full INT4 quantization, but with significantly
-# better quality. Ask your favorite LLM to categorize your HuggingFace model's
-# layers into these buckets to generate a .json file that maps layer names to
-# quantization levels and input that into this API.
 LAYER_PRECISION_MAPPING: dict[str, list[str]] = {
-    "FP16": ["embed", "lm_head"],
-    "INT8_SYM": ["q_proj", "k_proj", "v_proj", "o_proj"],
-    "INT4_SYM": ["gate_proj", "up_proj", "down_proj"],
+    "INT8_SYM": [
+        "embed",  # FP16 causes precision desync
+        "lm_head",  # Keeps the final word choice stable
+        "down_proj",  # The "Instruction" layer (prevents the User: tags)
+    ],
+    "INT4_SYM": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+    ],
 }
+
 # TODO: Make sure this works as FP16.
 UNKNOWN_QUANTIZATION_LEVEL: str = "INT8_SYM"
 QLEVEL_STR_TO_NNCF_MODE: dict[str, nncf.CompressWeightsMode] = {
@@ -91,13 +90,9 @@ class LayerSortingResult(NamedTuple):
 class Error(Exception):
     """Base exception class for this module."""
 
-    pass
-
 
 class CLIExportError(Error):
     """Raised when the optimum-cli export command fails."""
-
-    pass
 
 
 def sort_layers_by_precision(
@@ -191,7 +186,7 @@ def sort_layers_by_precision(
 
         # This provides substring matching from user-defined layer
         # names to model layer names.
-        # e.g. "q_proj" in "__module.model.layers.0.self_attn.q_proj/ov_ext::linear/MatMul"
+        # e.g. "q_proj" in "__module.model.layers.0.self_attn.q_proj/ov_ext::linear/MatMul"  # noqa: E501 # pylint: disable=line-too-long
         # We use lower() for case-insensitive matching against the map, but
         # store the original name.
         if any(x in layer.lower() for x in layer_precision_map.get("FP16", [])):
@@ -374,20 +369,6 @@ def quantize_and_save_model(
     # OpenVINO model, we need to set the type of model.model to ov.Model.
     ov_model: ov.Model = model.model  # type: ignore
 
-    # --- NNCF Graph Logging ---
-    # Create an NNCF graph to inspect the node names available for quantization
-    from nncf.common.factory import NNCFGraphFactory
-
-    nncf_graph = NNCFGraphFactory.create(model.model)
-    available_node_names = [
-        node.node_name for node in nncf_graph.get_all_nodes()
-    ]
-    logging.info(
-        "Available NNCF node names for quantization:\n%s",
-        json.dumps(available_node_names, indent=2),
-    )
-    # --- End of Logging ---
-
     sorting_result = sort_layers_by_precision(
         ov_model, layer_precision_mapping, unknown_quantization_level
     )
@@ -490,14 +471,6 @@ def run_sanitized_conversion() -> None:
         return
     size_gb = bin_file.stat().st_size / (1024**3)
     print(f"\n[Result] Final Model Size: {size_gb:.2f} GB")
-
-    # TODO: This is specifically for the Cydonia model I'm trying.
-    # It should be 12 GB.
-    if 10 < size_gb < 14:
-        print("SUCCESS: Model is INT4 and likely Stateful.")
-        print(f"Ready to serve: {final_dir}")
-    else:
-        print("WARNING: Model size is unexpected.")
 
 
 if __name__ == "__main__":
