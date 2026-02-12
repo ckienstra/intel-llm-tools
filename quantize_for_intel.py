@@ -20,12 +20,13 @@ top, and includes error handling and logging for better traceability of the
 conversion process.
 """
 
-import json
 import logging
 import math
 from pathlib import Path
 import shutil
 import subprocess
+import threading
+import time
 from typing import NamedTuple
 
 import nncf
@@ -33,6 +34,7 @@ import openvino as ov
 from openvino_tokenizers import convert_tokenizer
 from optimum.intel import OVModelForCausalLM
 from optimum.modeling_base import OptimizedModel
+from tqdm import tqdm
 from transformers import AutoConfig
 from transformers import AutoTokenizer
 
@@ -95,6 +97,44 @@ class CLIExportError(Error):
     """Raised when the optimum-cli export command fails."""
 
 
+def model_size_bytes(
+    input_dir: Path,
+) -> int:
+    """Estimate the memory footprint of the input model.
+
+    This is a rough, hacky estimate! It should be replaced with something
+    more reliable.
+
+    Args:
+        input_dir (Path): The location on disk of the OpenVINO-IR model
+                          to be quantized.
+    """
+    cmd: str = f"du -sh --bytes {input_dir} | cut -f 1"
+    output: subprocess.CompletedProcess = subprocess.run(
+        cmd,
+        shell=True,
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+    if output.returncode != 0:
+        logging.error(
+            "HuggingFace Accelerate command failed. If it is not installed, "
+            "run: `pip install accelerate`.",
+        )
+        return -1
+    size: int = -1
+    try:
+        size = int(output.stdout.strip())
+    except (ValueError, TypeError) as e:
+        logging.error(
+            f"Unable to parse output of command: `{cmd}`\n"
+            f"Output: {output.stdout.strip()}\nError: {e}"
+        )
+        return -1
+    return size
+
+
 def sort_layers_by_precision(
     ov_model: ov.Model,
     layer_precision_map: dict[str, list[str]],
@@ -130,14 +170,14 @@ def sort_layers_by_precision(
     }
     for op in ov_model.get_ops():
         if op.get_type_name() != "Constant":
-            logging.info(
+            logging.debug(
                 'Skipping non-constant op "%s" of type "%s".',
                 op.get_friendly_name(),
                 op.get_type_name(),
             )
             continue
 
-        # The 'layer' for NNCF is the operation that *consumes* the constant
+        # The 'layer' for NNCF is the operation that consumes the constant
         # weight, not the constant itself. We find the consumer node to get
         # the correct name for the ignored_scope.
         output_port = op.output(0)
@@ -149,13 +189,16 @@ def sort_layers_by_precision(
             )
             continue
 
-        consumer_op = next(iter(target_inputs)).get_node()
-        layer_name_node = consumer_op
+        # This iterator will be useful later when listing inputs.
+        consumer_op: ov.Node = next(iter(target_inputs)).get_node()
+        # NNCF's ignored_scope expects the full node name. Whatever the final
+        # node is, we'll use its "friendly name" to populate ignored_scope.
+        layer_name: str = ""
 
         # If the immediate consumer is a Convert or Gather operation, it is
         # likely an intermediate step. The actual layer to target is the
-        # consumer of *this* operation.
-        consumer_type = consumer_op.get_type_name()
+        # consumer of this operation.
+        consumer_type: str = consumer_op.get_type_name()
         if consumer_type in ["Convert", "Gather"]:
             logging.debug(
                 "Found intermediate op '%s' of type %s. "
@@ -164,22 +207,21 @@ def sort_layers_by_precision(
                 consumer_type,
             )
             # Using list() to exhaust the iterator and check its contents
-            real_consumer_inputs = list(
+            real_consumer_inputs: list[ov.Output] = list(
                 consumer_op.output(0).get_target_inputs()
             )
             if real_consumer_inputs:
                 # The real consumer is the node we want to name.
-                layer_name_node = real_consumer_inputs[0].get_node()
+                layer_name = (
+                    real_consumer_inputs[0].get_node().get_friendly_name()
+                )
             else:
+                layer_name = consumer_op.get_friendly_name()
                 logging.debug(
                     "Intermediate op '%s' has no consumers. "
                     "Using op's name as a fallback.",
                     consumer_op.get_friendly_name(),
                 )
-
-        # NNCF's ignored_scope expects the full node name. We use the friendly
-        # name of the consumer operation for this.
-        layer: str = layer_name_node.get_friendly_name()
 
         # Get parameter count (size) of the weight constant
         params: int = math.prod(op.get_output_tensor(0).get_shape())
@@ -189,20 +231,26 @@ def sort_layers_by_precision(
         # e.g. "q_proj" in "__module.model.layers.0.self_attn.q_proj/ov_ext::linear/MatMul"  # noqa: E501 # pylint: disable=line-too-long
         # We use lower() for case-insensitive matching against the map, but
         # store the original name.
-        if any(x in layer.lower() for x in layer_precision_map.get("FP16", [])):
-            layer_map["FP16"].append(layer)
+        # FIXME: Multi-line tuples are gross, but so is the unwrapped logic :-(
+        if any(
+            x in layer_name.lower() for x in layer_precision_map.get("FP16", [])
+        ):
+            layer_map["FP16"].append(layer_name)
             param_counts["FP16"] += params
         elif any(
-            x in layer.lower() for x in layer_precision_map.get("INT8_SYM", [])
+            x in layer_name.lower()
+            for x in layer_precision_map.get("INT8_SYM", [])
         ):
-            layer_map["INT8_SYM"].append(layer)
+            layer_map["INT8_SYM"].append(layer_name)
             param_counts["INT8_SYM"] += params
         elif any(
-            x in layer.lower() for x in layer_precision_map.get("INT4_SYM", [])
+            x in layer_name.lower()
+            for x in layer_precision_map.get("INT4_SYM", [])
         ):
-            layer_map["INT4_SYM"].append(layer)
+            layer_map["INT4_SYM"].append(layer_name)
             param_counts["INT4_SYM"] += params
         else:
+            # TODO: Drop to debug level when ready.
             logging.info(
                 "Unknown quantization level for op: "
                 '"%s" with %s parameters. '
@@ -211,7 +259,7 @@ def sort_layers_by_precision(
                 params,
                 unknown_quantization_level,
             )
-            layer_map[unknown_quantization_level].append(layer)
+            layer_map[unknown_quantization_level].append(layer_name)
             param_counts[unknown_quantization_level] += params
 
     # This output is really just for fun.
@@ -244,35 +292,12 @@ def format_and_save_tokenizer(
     Raises:
         FileNotFoundError: If the config.json file is not found in input_dir.
     """
-    # Check if the model is a Mistral model by inspecting its config
-    # TODO: "config.json" is specific to HuggingFace.
-    # TODO: Save the filename to a variable.
-    logging.info("\nChecking model config to determine tokenizer formatting.")
-    config_path: Path = input_dir / "config.json"
-    is_mistral_model: bool = False
-    if not config_path.exists():
-        raise FileNotFoundError(
-            f"Config file not found at {config_path}. "
-            "Cannot determine model type for tokenizer formatting."
-        )
-    with open(config_path, encoding="utf-8") as f:
-        config = json.load(f)
-        if config.get("model_type") == "mistral":
-            is_mistral_model = True
-
-    # If it's a Mistral model, apply the regex fix while loading.
-    # TODO: Do I need to save these to disk before converting to OpenVINO-IR?
-    if is_mistral_model:
-        logging.info("\nMistral model detected. Applying tokenizer regex fix.")
-        tokenizer = AutoTokenizer.from_pretrained(
-            input_dir, trust_remote_code=True, fix_mistral_regex=True
-        )
-    else:
-        logging.info("\nModel is not Mistral, skipping tokenizer patch.")
-        tokenizer = AutoTokenizer.from_pretrained(
-            input_dir, trust_remote_code=True
-        )
-
+    # It is safe to use fix_mistral_regex on non-mistral models.
+    # HuggingFace Transformers only applies the fix to models it recognizes as
+    # "older" mistral-base model names.
+    tokenizer = AutoTokenizer.from_pretrained(
+        input_dir, trust_remote_code=True, fix_mistral_regex=True
+    )
     ov_tokenizer: ov.Model | tuple[ov.Model, ov.Model] = convert_tokenizer(
         tokenizer, with_detokenizer=True
     )
@@ -301,8 +326,8 @@ def convert_hf_to_openvino_ir(input_dir: Path, output_dir: Path) -> None:
     logging.info("\nConverting HuggingFace model to OpenVINO.")
     # Can we get a loading bar here?
     # It just hangs for a while during export with no user feedback.
-    # How are the nice "Applying Weight Compression" loading bars done in the
-    # optimum-cli tool?
+    # Perhaps we could trick tqdm by comparing input vs output sizes?
+    # The sizes should be identical, since they should both be FP16.
     # Additionally, we should ensure the disk has enough space to save an
     # extra FP16 copy of the model for export.
     cmd = [
@@ -319,12 +344,80 @@ def convert_hf_to_openvino_ir(input_dir: Path, output_dir: Path) -> None:
         str(output_dir),
     ]
     logging.info("Executing: %s", " ".join(cmd))
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        raise CLIExportError(
-            f"CRITICAL: optimum-cli Export failed: {e}",
-        ) from e
+    input_size = model_size_bytes(input_dir)
+    if input_size <= 0:
+        logging.warning(
+            "Could not determine input model size. "
+            "Skipping progress bar for conversion."
+        )
+        try:
+            # Run without progress bar, but capture output for better errors.
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logging.error("optimum-cli export stdout:\n%s", e.stdout)
+            logging.error("optimum-cli export stderr:\n%s", e.stderr)
+            raise CLIExportError(
+                f"CRITICAL: optimum-cli Export failed: {e}",
+            ) from e
+        return
+
+    # We redirect stdout to DEVNULL to prevent optimum-cli's own progress
+    # indicators from interfering with our tqdm bar. Stderr is captured to
+    # be displayed in case of an error.
+    process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+    )
+
+    def progress_monitor(progress_bar: tqdm) -> None:
+        """Monitor the output directory size and update the progress bar."""
+        last_size = 0
+        while process.poll() is None:
+            if not output_dir.exists():
+                time.sleep(1)
+                continue
+            current_size = model_size_bytes(output_dir)
+            update_amount = current_size - last_size
+            if update_amount > 0:
+                progress_bar.update(update_amount)
+                last_size = current_size
+            time.sleep(5)  # Poll every 5 seconds.
+
+        # One final update to catch writes that happened after the last poll
+        if output_dir.exists():
+            current_size = model_size_bytes(output_dir)
+            update_amount = current_size - last_size
+            if update_amount > 0:
+                progress_bar.update(update_amount)
+
+    # Spawn the progress_monitor thread in a context, just in case.
+    with tqdm(
+        total=input_size,
+        mininterval=10,
+        unit="B",
+        unit_scale=True,
+        desc="Exporting model",
+    ) as pbar:
+        monitor_thread = threading.Thread(
+            target=progress_monitor,
+            args=(pbar,),
+        )
+        monitor_thread.start()
+
+        # process.communicate replies with [stdout, stderr]
+        stderr_output: str = process.communicate()[1]  # Wait for completion
+        monitor_thread.join()
+
+    if process.returncode != 0:
+        error_message = (
+            f"CRITICAL: optimum-cli Export failed with return code "
+            f"{process.returncode}."
+        )
+        if stderr_output:
+            error_message += f"\nStderr:\n{stderr_output.strip()}"
+        raise CLIExportError(error_message)
 
 
 def quantize_and_save_model(
