@@ -39,7 +39,7 @@ from transformers import AutoConfig
 from transformers import AutoTokenizer
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
-logging.getLogger("nncf").setLevel(logging.DEBUG)
+logging.getLogger("nncf").setLevel(logging.INFO)
 
 # --- CONFIGURATION --- #
 # TODO: Turn all of this into API parameters.
@@ -193,7 +193,7 @@ def sort_layers_by_precision(
         consumer_op: ov.Node = next(iter(target_inputs)).get_node()
         # NNCF's ignored_scope expects the full node name. Whatever the final
         # node is, we'll use its "friendly name" to populate ignored_scope.
-        layer_name: str = ""
+        layer_name: str = consumer_op.get_friendly_name()
 
         # If the immediate consumer is a Convert or Gather operation, it is
         # likely an intermediate step. The actual layer to target is the
@@ -216,7 +216,7 @@ def sort_layers_by_precision(
                     real_consumer_inputs[0].get_node().get_friendly_name()
                 )
             else:
-                layer_name = consumer_op.get_friendly_name()
+                # Falls back to original layer_name definition.
                 logging.debug(
                     "Intermediate op '%s' has no consumers. "
                     "Using op's name as a fallback.",
@@ -250,8 +250,7 @@ def sort_layers_by_precision(
             layer_map["INT4_SYM"].append(layer_name)
             param_counts["INT4_SYM"] += params
         else:
-            # TODO: Drop to debug level when ready.
-            logging.info(
+            logging.debug(
                 "Unknown quantization level for op: "
                 '"%s" with %s parameters. '
                 "Assigning to %s.",
@@ -383,7 +382,10 @@ def convert_hf_to_openvino_ir(input_dir: Path, output_dir: Path) -> None:
             if update_amount > 0:
                 progress_bar.update(update_amount)
                 last_size = current_size
-            time.sleep(5)  # Poll every 5 seconds.
+            # Poll every second.
+            # Sometimes `du` will hang for a few seconds, so
+            # regular updates help show progress.
+            time.sleep(1)
 
         # One final update to catch writes that happened after the last poll
         if output_dir.exists():
@@ -395,7 +397,7 @@ def convert_hf_to_openvino_ir(input_dir: Path, output_dir: Path) -> None:
     # Spawn the progress_monitor thread in a context, just in case.
     with tqdm(
         total=input_size,
-        mininterval=10,
+        mininterval=1,
         unit="B",
         unit_scale=True,
         desc="Exporting model",
