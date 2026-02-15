@@ -257,8 +257,8 @@ generated-members=
 # Maximum number of characters on a single line.
 max-line-length=80
 
-# TODO(https://github.com/pylint-dev/pylint/issues/3352): Direct pylint to exempt
-# lines made too long by directives to pytype.
+# Configure Flake8 E501 to use the same line length.
+load-plugins=pylint.extensions.code_style
 
 # Regexp for a line that is allowed to be longer than the limit.
 ignore-long-lines=(?x)(

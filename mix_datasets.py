@@ -180,6 +180,9 @@ class DatasetMixer:
             )
             found_samples = 0
             for item in dataset.take(max_items_to_check):
+                # FIXME: Some tiny data sets might not have enough samples
+                # > 2048 bytes to fulfill the requirement. That should be
+                # handled.
                 if found_samples >= num_samples_for_ds:
                     break
 

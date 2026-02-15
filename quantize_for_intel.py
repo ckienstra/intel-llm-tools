@@ -128,8 +128,10 @@ def model_size_bytes(
         size = int(output.stdout.strip())
     except (ValueError, TypeError) as e:
         logging.error(
-            f"Unable to parse output of command: `{cmd}`\n"
-            f"Output: {output.stdout.strip()}\nError: {e}"
+            "Unable to parse output of command: `%s`\nOutput: %s\nError: %s",
+            cmd,
+            output.stdout.strip(),
+            e,
         )
         return -1
     return size
@@ -233,7 +235,8 @@ def sort_layers_by_precision(
         # store the original name.
         # FIXME: Multi-line tuples are gross, but so is the unwrapped logic :-(
         if any(
-            x in layer_name.lower() for x in layer_precision_map.get("FP16", [])
+            x in layer_name.lower()
+            for x in layer_precision_map.get("FP16", [])
         ):
             layer_map["FP16"].append(layer_name)
             param_counts["FP16"] += params

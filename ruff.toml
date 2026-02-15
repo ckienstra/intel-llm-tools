@@ -3,7 +3,9 @@
 # https://github.com/google/styleguide/blob/gh-pages/pylintrc
 
 # 1. Formatting (Replaces Pyink/Black)
-line-length = 80
+# I've found that a setting of 80 will allow 81-character rows.
+# Shortening it to 79 seems to keep it <=80, as desired.
+line-length = 79
 indent-width = 4
 target-version = "py311" # Adjust to your python version
 
