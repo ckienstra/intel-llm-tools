@@ -1,0 +1,51 @@
+{
+    "workbench.colorTheme": "Solarized Dark",
+    "remote.SSH.remotePlatform": {
+        "10.1.0.103": "linux"
+    },
+    "python.analysis.typeCheckingMode": "standard",
+    "pythonautovenv.enable": false,
+    "geminicodeassist.inlineSuggestions.enableAuto": true,
+    "diffEditor.codeLens": true,
+    "git.autofetch": true,
+    // =========================================================================
+    // General Editor Settings
+    // =========================================================================
+    "editor.formatOnSave": true,
+    "files.trimTrailingWhitespace": true,
+    "files.insertFinalNewline": true,
+    // =========================================================================
+    // Python-Specific Settings (Using Ruff)
+    // =========================================================================
+    "[python]": {
+        "editor.defaultFormatter": "charliermarsh.ruff",
+        "editor.formatOnSave": false,
+        "editor.codeActionsOnSave": {
+            "source.organizeImports.ruff": "explicit",
+            "source.fixAll.ruff": "explicit"
+        }
+    },
+    // Enable ruff for stuff like fast import sorting
+    "ruff.enable": true,
+    // --- PYLINT CONFIGURATION (Deep Linter) ---
+    "pylint.args": [
+        "--rcfile=${workspaceFolder}/.pylintrc",
+        "--jobs=0" // Use all CPU cores for speed
+    ],
+    // Optional: Hide Pylint warnings that Ruff already covers
+    // (To reduce noise, though keeping both is safer)
+    "pylint.severity": {
+        "convention": "Information",
+        "error": "Error",
+        "fatal": "Error",
+        "refactor": "Warning",
+        "warning": "Warning"
+    },
+    "github.copilot.enable": {
+        "*": false,
+        "plaintext": false,
+        "markdown": false,
+        "scminput": false
+    },
+    "geminicodeassist.project": "gen-lang-client-0194048192"
+}

@@ -1,15 +1,20 @@
-import os
-import sys
-import torch
-import shutil
-import logging
+"""A wrapper for Intel AutoRound for my personal home PC."""
+
 import argparse
+import logging
+import os
 from pathlib import Path
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import shutil
+import sys
+from typing import Any
+
 # auto_round is in this environment, but VSCode doesn't like it for some reason
 from auto_round import AutoRound  # type: ignore
 from datasets import load_dataset
+import torch
 from tqdm import tqdm
+from transformers import AutoModelForCausalLM
+from transformers import AutoTokenizer
 
 # Example output:
 # .\quantize-heretic-quality.py \
@@ -22,10 +27,10 @@ from tqdm import tqdm
 # 1. Configuration
 torch.set_float32_matmul_precision("high")
 # I don't know how to get the local path working properly yet
-# model_name = "C:\Users\Chris\.cache\huggingface\hub\models--coder3101--Cydonia-24B-v4.3-heretic-v2\snapshots\4e48125d201aaeeb6d6f9349c8c75e772fcfbb25"
+# model_name = "C:\Users\Chris\.cache\huggingface\hub\models--coder3101--Cydonia-24B-v4.3-heretic-v2\snapshots\4e48125d201aaeeb6d6f9349c8c75e772fcfbb25"  # noqa: E501 # pylint: disable=line-too-long
 default_model_name = "coder3101/Cydonia-24B-v4.3-heretic-v2"
 default_output_dir = Path(".") / (
-    default_model_name.split("/")[-1] + "-quantized-auto-round"
+    default_model_name.rsplit("/", maxsplit=1)[-1] + "-quantized-auto-round"
 )
 
 
@@ -52,12 +57,14 @@ def setup_logger(name: str = "auto_round_quantization") -> logging.Logger:
 
 
 def save_formats(
-    autoround: AutoRound,
+    # TODO: Type 'AutoRound' seems problematic.
+    autoround: Any,
     logger: logging.Logger,
     formats: list[str],
     output_dir: Path,
     interactive: bool = False,
 ) -> None:
+    """Save the quantized model in requested formats."""
     final_formats: dict[str, bool] = {fmt: False for fmt in formats}
     if not final_formats:
         logger.info("No formats specified; nothing to save.")
@@ -78,45 +85,54 @@ def save_formats(
                     "*.tiktoken",
                 ]
                 for ext in extensions:
-                    # TODO: This attribute is private; find a better way to get the original model path
+                    # TODO: This attribute is private.
+                    # # Find a better way to get the original model path.
                     original_model_path = Path(
-                        autoround.model.config._name_or_path
+                        # TODO: Find a public means of getting this path.
+                        autoround.model.config._name_or_path  # noqa: E501 # pylint: disable=protected-access,line-too-long
                     )
                     for src in original_model_path.glob(ext):
                         shutil.copy(src, output_path)
-                # AutoRound only copies some files by default. Copy all of them.
+                # AutoRound only copies some files by default.
+                # Copy all of them for tools further down the pipeline.
                 final_formats[fmt] = True
             break
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-except
             # Saving can fail for many reasons; log and allow the caller to
             # decide whether to retry or exit. In non-interactive mode we
             # do not prompt, to avoid blocking automated runs.
             logger.error(f"Failed to save quantized model. Exception: {e}")
             for fmt, completed in final_formats.items():
-                logger.error(
-                    f"  {fmt} - {'SUCCESS' if completed else 'FAILED'}"
-                )
+                status: str = "FAILED" if not completed else "SUCCESS"
+                logger.error(f"  {fmt} - {status}")
             if not interactive:
                 logger.info("Non-interactive mode: aborting format save loop.")
                 break
             add_formats: str = input(
-                "If you'd like to try saving to any other formats before exit, "
-                "enter them here. i.e. auto_gptq,auto_awq or press Enter to exit: "
+                "If you'd like to try saving to any other formats before exit,"
+                " enter them here. "
+                "i.e. auto_gptq,auto_awq or press Enter to exit: "
             )
             if not add_formats.strip():
                 break
-            for fmt in [f.strip() for f in add_formats.split(",") if f.strip()]:
+            for fmt in [
+                f.strip() for f in add_formats.split(",") if f.strip()
+            ]:
                 final_formats.setdefault(fmt, False)
     logger.info("Format summary:")
     for fmt, completed in final_formats.items():
-        logger.info(f"  {fmt} - {'SUCCESS' if completed else 'FAILED'}")
+        status: str = "FAILED" if not completed else "SUCCESS"
+        logger.info(f"  {fmt} - {status}")
 
 
 def get_pippa_calibration_data(
-    tokenizer: AutoTokenizer, num_samples: int = 512, min_seqlen: int = 2048
+    # NOTE: It should be an AutoTokenizer, but "from_pretrained" turns
+    # it into an Unknown.
+    tokenizer: Any,
+    num_samples: int = 512,
+    min_seqlen: int = 2048,
 ) -> list[str]:
-    """
-    Fetches and formats the PygmalionAI/PIPPA dataset for calibration.
+    """Fetches and formats the PygmalionAI/PIPPA dataset for calibration.
 
     This function downloads the PIPPA dataset, formats conversations into
     a single string per sample, and returns a list of strings. It filters
@@ -125,24 +141,30 @@ def get_pippa_calibration_data(
     """
     logger = logging.getLogger("auto_round_quantization")
     logger.info(
-        f"Fetching and processing {num_samples} samples from PygmalionAI/PIPPA with min length {min_seqlen} tokens..."
+        "Fetching and processing %s samples from "
+        "PygmalionAI/PIPPA with min length %s tokens.",
+        num_samples,
+        min_seqlen,
     )
 
     # We need to iterate through the dataset until we find enough long samples.
-    # Set a max number of items to check to avoid an infinite loop. A 5% success
-    # rate for long samples is a reasonable guess for PIPPA.
+    # Set a max number of items to check to avoid an infinite loop.
+    # FIXME: A 5% success rate for long samples is a reasonable guess for
+    # PIPPA, but this is just a guess :-)
     max_items_to_check = num_samples * 20
     try:
         # Use streaming to avoid downloading the entire massive dataset
         dataset = load_dataset(
             "json",
-            data_files="https://huggingface.co/datasets/PygmalionAI/PIPPA/resolve/main/pippa_deduped.jsonl",
+            data_files="https://huggingface.co/datasets/PygmalionAI/PIPPA/resolve/main/pippa_deduped.jsonl",  # noqa: E501 # pylint: disable=line-too-long
             split="train",
             streaming=False,
         )
-    except Exception as e:
+    except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error(
-            f"Failed to load PIPPA dataset. Make sure 'datasets' and 'tqdm' are installed (`pip install datasets tqdm`). Error: {e}"
+            "Failed to load PIPPA dataset. Make sure 'datasets' and 'tqdm' "
+            "are installed (`pip install datasets tqdm`). Error: %s",
+            e,
         )
         return []
 
@@ -156,12 +178,15 @@ def get_pippa_calibration_data(
             break  # We have enough
 
         conversation_text = ""
-        if "conversation" not in data_item or not isinstance(
-            data_item["conversation"], list
+        # If data_item is a Mapping, MutableMapping, or dict, then
+        # __getitem__ should exist. If not, isinstance won't be satisfied.
+        # Then we can check if the value is a list type.
+        if "conversation" not in data_item or not isinstance(  # type: ignore
+            data_item["conversation"], list  # type: ignore
         ):
             continue
 
-        for turn in data_item["conversation"]:
+        for turn in data_item["conversation"]:  # type: ignore
             if (
                 not isinstance(turn, dict)
                 or "is_human" not in turn
@@ -188,26 +213,35 @@ def get_pippa_calibration_data(
 
     if len(calibration_data) < num_samples:
         logger.warning(
-            f"Only able to find {len(calibration_data)} / {num_samples} samples long enough (>= {min_seqlen} tokens) after checking {max_items_to_check} records."
+            "Only able to find %s / %s "
+            "samples long enough (>= %s tokens) after checking "
+            "%s records.",
+            len(calibration_data),
+            num_samples,
+            min_seqlen,
+            max_items_to_check,
         )
 
     logger.info(
-        f"Successfully processed {len(calibration_data)} samples from PIPPA."
+        "Successfully processed %s samples from PIPPA.", len(calibration_data)
     )
     return calibration_data
 
 
 def main() -> None:
+    """Do the actual work of running AutoRound."""
     logger = setup_logger()
 
     # Parse CLI early so flags can influence behavior before heavy work begins.
     parser = argparse.ArgumentParser(
-        description="Quantize a model using AutoRound and save in multiple formats."
+        description="Quantize a model using AutoRound and save in multiple "
+        "formats."
     )
     parser.add_argument(
         "--model-name",
         default=default_model_name,
-        help="Model identifier, e.g. owner/model (must contain a forward slash).",
+        help="Model identifier, e.g. owner/model "
+        "(must contain a forward slash).",
     )
     parser.add_argument(
         "--formats",
@@ -218,7 +252,8 @@ def main() -> None:
         "--dataset",
         default="pile",
         choices=["pile", "pippa", "c4"],
-        help='Calibration dataset to use. "pile" for NeelNanda/pile-10k, "pippa" for PygmalionAI/PIPPA, "c4" for allenai/c4.',
+        help='Calibration dataset to use. "pile" for NeelNanda/pile-10k, '
+        '"pippa" for PygmalionAI/PIPPA, "c4" for allenai/c4.',
     )
     parser.add_argument(
         "--nsamples",
@@ -251,7 +286,7 @@ def main() -> None:
         else Path(".") / (model_name.split("/")[-1] + "-quantized-auto-round")
     )
 
-    logger.info(f"Loading tokenizer for {model_name}...")
+    logger.info("Loading tokenizer for %s.", model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
     # AutoRound's default sequence length for calibration is 2048. We must
@@ -276,14 +311,16 @@ def main() -> None:
     # A VC Build Tools update can update the version number in this path
     os.environ["PATH"] += (
         os.pathsep
-        + r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64"
+        + r"C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64"  # noqa: E501 # pylint: disable=line-too-long
     )
     # 2. Load the model directly to the RTX 5090
-    # 24B parameters in BF16 take ~48GB. How does Gemini know this? It's correct.
+    # 24B parameters in BF16 takes ~48GB.
     # Saving to "fake" format requires the 2x of full F16 model size in RAM,
-    # so 96GB for 24B model. It might be smart to write a memory checker to fail
-    # before starting quantization if there isn't enough RAM + Pagefile.
-    # Warn if the pagefile will cause swapping, fail if not enough total memory.
+    # so 96GB for 24B model. It might be smart to run a memory checker
+    # before starting quantization in case there isn't enough RAM + Pagefile.
+    # Maybe:
+    # - Warn if lack of RAM the will cause swapping
+    # - Raise error if not enough total memory (RAM + Pagefile) to succeed.
     # That prevents hours of wasted time only to fail at the end.
     # Also make an option to save output to a log.
     #
@@ -292,13 +329,14 @@ def main() -> None:
     # not all of this automatically. Add a flag --copy-original-file=<filename>
     # which can be specified multiple times to copy specific files from the
     # original model folder to the quantized model folder.
-    # Cydonia, a Mistral-based model, needs special_tokens_map.json copied over.
+    # Cydonia, a Mistral-based model, needs special_tokens_map.json copied
+    # to the output folder.
     # Additionally x3, AutoRound messes up config.json, so also copy that after
     # quantization is complete.
 
-    logger.info(f"Loading {model_name} to System RAM...")
-    # Use device_map={'': 'cpu'} to ensure no weights are left on the 'meta' device
-    # This does not modify statefulness of the model.
+    logger.info("Loading %s to System RAM.", model_name)
+    # Use device_map={'': 'cpu'} to ensure no weights are left on the 'meta'
+    # device.
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         torch_dtype=torch.bfloat16,
@@ -307,7 +345,7 @@ def main() -> None:
     )
 
     # 3. Initialize AutoRound for CUDA
-    # enable_torch_compile=True works very well on RTX 50-series/40-series cards
+    # enable_torch_compile=True works well on RTX 50-series/40-series cards.
     # I need to launch this script from within a Visual Studio 2022 environment
     # for all the optimizations to work. This is not an optimization that would
     # work on the server, so I am not going to waste any more time on it.
@@ -318,8 +356,9 @@ def main() -> None:
     # unfortunately, it slows quantization time by ~50%-100%,
     # but it can save up to 25% of system memory.
     # https://github.com/intel/auto-round/blob/main/docs/step_by_step.md#quantization-costs
-    # Additionally, how ridiculous would it be to check the file size of the model,
-    # look at VRAM size, and decide whether to enable low_gpu_mem_usage automatically?
+    # Additionally, how ridiculous would it be to check the file size of the
+    # model, look at VRAM size, and decide whether to enable low_gpu_mem_usage
+    # automatically?
     logger.info("Initializing AutoRound quantization...")
     autoround = AutoRound(
         model,
@@ -334,13 +373,14 @@ def main() -> None:
         device_map="cuda",
     )
 
-    logger.info(f"Quantizing and saving quantized model to {out_dir}...")
+    logger.info("Quantizing and saving quantized model to %s.", out_dir)
     logger.info(
         "This may take several hours depending on the model size and hardware."
     )
     logger.info("You will receive this error: ")
     logger.info(
-        "this API is deprecated; this script will continue to use AutoRound.quantize() as it is compatible with current environment"
+        "this API is deprecated; this script will continue to use "
+        "AutoRound.quantize() as it is compatible with current environment"
     )
     logger.info("This is expected and should be ignored.")
     # Ignore the deprecation warning.
@@ -354,7 +394,7 @@ def main() -> None:
         interactive=args.interactive,
     )
     logger.info("Auto-round quantization process complete.")
-    logger.info(f"Quantized model saved to: {out_dir}")
+    logger.info("Quantized model saved to: %s.", out_dir)
 
 
 if __name__ == "__main__":

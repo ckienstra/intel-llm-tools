@@ -1,13 +1,19 @@
 # ruff.toml
-# This file is a Gemini-interpreted comversion of:
+# This file is a semi Gemini-interpreted conversion of:
 # https://github.com/google/styleguide/blob/gh-pages/pylintrc
 
-# 1. Formatting (Replaces Pyink/Black)
+# Global settings must be at the top of this file.
+#
+# Error "line to long" is not "fixable" as of Ruff v0.15.0:
+# https://docs.astral.sh/ruff/rules/#error-e
 # I've found that a setting of 80 will allow 81-character rows.
 # Shortening it to 79 seems to keep it <=80, as desired.
+# This *sorta* works, but it doesn't help reformat code strings, docstrings,
+# and comments like I am used to. Black also does not provide this due to its
+# shared design philosophy.
 line-length = 79
 indent-width = 4
-target-version = "py311" # Adjust to your python version
+target-version = "py312" # 3.12.0, speficically
 
 [format]
 quote-style = "double"
@@ -15,7 +21,6 @@ indent-style = "space"
 skip-magic-trailing-comma = false
 line-ending = "auto"
 
-# 2. Linting (Speedy checks)
 [lint]
 # Enable specific rule sets to match Google's strictness:
 # E, W: Standard pycodestyle errors
@@ -26,13 +31,12 @@ line-ending = "auto"
 # UP: Pyupgrade (Modernize syntax)
 select = ["E", "F", "W", "I", "B", "D", "UP"]
 
-# Ignore specific conflicts if necessary
-ignore = []
+# Deduplicate "line too long" error, which is already flagged by Flake8.
+ignore = ["E501"]
 
-# 3. Google-Specific Settings
 [lint.pydocstyle]
 convention = "google"
 
 [lint.isort]
-force-single-line = true   # Google prefers one import per line
+force-single-line = true   # One import per line
 force-sort-within-sections = true

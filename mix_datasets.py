@@ -1,13 +1,15 @@
-# mix_datasets.py
-#
-# The goal of this file is to consume a json config of dataset names
-# and mix them by percentage for model calibration.
-#
+"""mix_datasets.py - Mix datasets by percentage.
+
+The goal of this file is to consume a json config of dataset names
+and mix them by percentage for model calibration.
+"""
+
 import argparse
 import json
 import logging
 import math
-from transformers import AutoTokenizer
+from typing import Any
+
 from datasets import load_dataset
 from tqdm import tqdm
 
@@ -20,7 +22,7 @@ from tqdm import tqdm
 #       "name": "PygmalionAI/PIPPA",
 #       "percentage": 0.5,
 #       "type": "json",
-#       "data_files": "https://huggingface.co/datasets/PygmalionAI/PIPPA/resolve/main/pippa_deduped.jsonl",
+#       "data_files": "https://huggingface.co/datasets/PygmalionAI/PIPPA/resolve/main/pippa_deduped.jsonl",  # noqa: E501 # pylint: disable=line-too-long
 #       "text_field": "conversation"
 #     },
 #     {
@@ -31,6 +33,24 @@ from tqdm import tqdm
 #     }
 #   ]
 # }
+#
+# TODO: Add a "streaming" JSON field. Validate it by checking if the
+# dataset is in Parquet format or make a recommendation to disable streaming
+# if the dataset is small.
+# TODO: See what dataset classes exist from HuggingFace. I suspect there's
+# a class that supports custom tokenizer definitions which can be imported
+# and used for this dataset mixer. I think this is why AutoRound supports
+# such a limited number of datasets.
+# Datasets to consider:
+# In Parquet columnar format, designed for streaming:
+# PIPPA: Chat-formatted, creative writing, dialogue
+# WikiText-2: Markdown writing and language fluency
+# FineWeb-EDU: STEM data for a "smart assistant" that can use reasoning
+# FineWeb: CommonCrawl-like SFW whole-internet snapshot
+# Legacy, in Gzipped JSON files:
+# allenai/c4: Plaintext. Document summarization, coding, reasoning
+# Don't use:
+# NeelNanda/pile-10k: Small, causes calibration overfitting auto-round-best
 
 parser: argparse.ArgumentParser = argparse.ArgumentParser(
     description="Mix datasets from a JSON config."
@@ -38,70 +58,73 @@ parser: argparse.ArgumentParser = argparse.ArgumentParser(
 parser.add_argument("config_file", help="Path to the JSON config file.")
 args: argparse.Namespace = parser.parse_args()
 
-config: dict = json.load(open(args.config_file, "r"))
+config: dict = json.load(open(args.config_file, encoding="utf-8"))
 
 
 class Error(Exception):
-    """
-    Base class for exceptions
-    """
+    """Base class for exceptions."""
 
     pass
 
 
 class InvalidConfigurationError(Error):
-    """
-    Raised when the configuration is invalid
-    """
+    """Raised when the configuration is invalid."""
 
     pass
 
 
 class DatasetMixer:
-    """
+    """Provides a class to mix datasets by percentage.
+
     A class to handle the loading and mixing of multiple datasets
-    based on a provided configuration.
+    based on a provided JSON configuration.
     """
 
     def __init__(
         self,
         logger,
         tokenizer,
-        config,
+        mixer_config,
     ) -> None:
+        """Initializes the DatasetMixer."""
         self._logger: logging.Logger = logger
-        self._tokenizer: AutoTokenizer = tokenizer
-        self._config: dict = config
+        # NOTE: It should be an AutoTokenizer, but "from_pretrained" turns
+        # it into an Unknown.
+        self._tokenizer: Any = tokenizer
+        self._config: dict = mixer_config
         self.calibration_data: list[str] = []
 
     @property
     def logger(self) -> logging.Logger:
+        """Returns the logger."""
         return self._logger
 
     @property
-    def tokenizer(self) -> AutoTokenizer:
+    def tokenizer(self) -> Any:
+        """Returns the tokenizer."""
         return self._tokenizer
 
     @property
     def config(self) -> dict:
+        """Returns the configuration."""
         return self._config
 
     def validate(self) -> None:
+        """Validates the configuration."""
         percentage_sum = 0
         total_samples = self.config.get("samples", 0)
         if total_samples < 0 or total_samples > 1024:
             raise InvalidConfigurationError(
-                "Total samples must be between 0 and 1024. Got: %s",
-                total_samples,
+                f"Total samples must be between 0 and 1024. "
+                f"Got: {total_samples}"
             )
 
         for dataset in self.config.get("datasets", []):
             name = dataset.get("name")
             if not name or "/" not in name:
                 raise InvalidConfigurationError(
-                    "All datasets must have a HuggingFace dataset name. "
-                    "Got: %s",
-                    name,
+                    f"All datasets must have a HuggingFace dataset name. "
+                    f"Got: {name}"
                 )
             percentage = dataset.get("percentage")
             if percentage is None:
@@ -112,24 +135,21 @@ class DatasetMixer:
             # percentage == 0 is allowed if you want to easily exclude a
             # dataset during quick iteration of your config without
             # removing its entire config stanza.
-            if not (0 <= percentage <= 1):
+            if not 0 <= percentage <= 1:
                 raise InvalidConfigurationError(
-                    "All datasets must have a percentage between 0 and 1. "
-                    "Got: %s",
-                    percentage,
+                    f"Datasets must have a percentage between 0% and 100%. "
+                    f"Got: {percentage}"
                 )
             percentage_sum += percentage
 
         # Use math.isclose for floating point comparison
         if not math.isclose(percentage_sum, 1.0):
             raise InvalidConfigurationError(
-                "Dataset percentages must sum to 1. Got: %s", percentage_sum
+                f"Dataset percentages must sum to 1. Got: {percentage_sum}"
             )
 
     def mix(self) -> list[str]:
-        """
-        Processes the datasets defined in the config and returns a mixed list of samples.
-        """
+        """Processes the datasets return a mixed list of samples."""
         total_samples = self.config.get("samples", 512)
         min_seqlen = self.config.get("seqlen", 2048)
         mixed_data = []
@@ -153,7 +173,7 @@ class DatasetMixer:
             max_items_to_check = num_samples_for_ds * 20
 
             self.logger.info(
-                f"Attempting to find {num_samples_for_ds} samples from {name}..."
+                f"Attempting to find {num_samples_for_ds} samples from {name}"
             )
 
             load_args = {"path": name, "split": ds_info.get("split", "train")}
@@ -161,17 +181,16 @@ class DatasetMixer:
                 load_args["path"] = ds_info.get("type", "json")
                 load_args["data_files"] = ds_info["data_files"]
 
-            try:
-                # streaming=True is more memory efficient for large datasets
-                dataset = load_dataset(**load_args, streaming=True)
-            except Exception as e:
-                self.logger.error(f"Failed to load dataset {name}. Error: {e}")
-                continue
+            # streaming=True is more memory efficient for large datasets
+            # This doesn't work well with older formatted datasets like
+            # Pyle 10k
+            dataset = load_dataset(**load_args, streaming=True)
 
             text_field = ds_info.get("text_field")
             if not text_field:
                 self.logger.error(
-                    f"Config for dataset {name} is missing 'text_field'. Skipping."
+                    f"Config for dataset {name} is missing 'text_field'. "
+                    f"Skipping."
                 )
                 continue
 
@@ -198,8 +217,9 @@ class DatasetMixer:
                     text = convo_text
 
                 if text and isinstance(text, str):
-                    # AutoTokenizer is untyped, unfortunately, but it can provide a callable
-                    # if it is instantiated and "from_pretrained" is called on it.
+                    # AutoTokenizer is untyped, unfortunately, but it can
+                    # provide a callable if it is instantiated and
+                    # "from_pretrained" is called on it.
                     token_count = len(
                         self.tokenizer(text, add_special_tokens=True)[
                             "input_ids"
